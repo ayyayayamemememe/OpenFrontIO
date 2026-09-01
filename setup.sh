@@ -1,6 +1,13 @@
 #!/bin/bash
-# Comprehensive setup script for Hetzner server with Docker, user setup, Node Exporter, and OpenTelemetry
-# Exit on error
+# Comprehensive setup script for a Linux VPS (adapted from the upstream OpenFrontIO
+# script for OVHcloud — works on any Ubuntu/Debian box) with Docker, user setup,
+# a Cloudflare Tunnel, Node Exporter, and OpenTelemetry.
+#
+# This box never opens an inbound port for the game: cloudflared makes an outbound
+# connection to Cloudflare's edge, and Cloudflare routes your domain's traffic back
+# down that tunnel to an internal-only Traefik, which fans it out to whichever app
+# container(s) are currently live (blue/green).
+
 set -e
 
 echo "====================================================="
@@ -27,12 +34,19 @@ if [ -z "$OTEL_EXPORTER_OTLP_ENDPOINT" ] || [ -z "$OTEL_AUTH_HEADER" ]; then
     exit 1
 fi
 
-# CF_ORIGIN_CERT and CF_ORIGIN_KEY: Cloudflare Origin Certificate and private key.
-# Generate at: Cloudflare dashboard → SSL/TLS → Origin Server → Create Certificate
-if [ -z "$CF_ORIGIN_CERT" ] || [ -z "$CF_ORIGIN_KEY" ]; then
-    echo "❌ ERROR: CF_ORIGIN_CERT and CF_ORIGIN_KEY are not set!"
-    echo "Generate an origin certificate at: Cloudflare → SSL/TLS → Origin Server → Create Certificate"
-    echo "Then add CF_ORIGIN_CERT and CF_ORIGIN_KEY to .env.setup"
+# CF_TUNNEL_TOKEN: token for a Cloudflare Tunnel. Authenticates cloudflared to your
+# Cloudflare account with no locally-managed certs or config files.
+# Generate one at: Cloudflare Zero Trust dashboard -> Networks -> Tunnels ->
+# Create a tunnel -> Docker, then copy the token out of the install command shown.
+# Add a Public Hostname for your domain in that same dashboard, pointing it at:
+#   http://traefik:80
+# That's the only "ingress rule" you need — it lives in Cloudflare's config, not
+# on this box.
+if [ -z "$CF_TUNNEL_TOKEN" ]; then
+    echo "❌ ERROR: CF_TUNNEL_TOKEN is not set!"
+    echo "Create a tunnel at: Cloudflare Zero Trust -> Networks -> Tunnels -> Create a tunnel -> Docker"
+    echo "Copy the token from the install command it shows you, then add it to .env.setup"
+    echo "Point the tunnel's Public Hostname at: http://traefik:80"
     exit 1
 fi
 
@@ -72,7 +86,6 @@ fi
 if groups openfront | grep -q '\bdocker\b'; then
     echo "User openfront is already in the docker group"
 else
-    # Add openfront to docker group
     usermod -aG docker openfront
     echo "Added openfront to docker group"
 fi
@@ -91,19 +104,16 @@ if [ -f /root/.ssh/authorized_keys ] && [ ! -f /home/openfront/.ssh/authorized_k
     echo "SSH keys copied from root to openfront"
 fi
 
-# Configure UDP buffer sizes for Cloudflare Tunnel
+# Configure UDP buffer sizes. Both the game's own WebSocket/QUIC traffic and
+# cloudflared's tunnel protocol (QUIC by default) benefit from this.
 # https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
 echo "🔧 Configuring UDP buffer sizes..."
-# Check if settings already exist in sysctl.conf
 if grep -q "net.core.rmem_max" /etc/sysctl.conf && grep -q "net.core.wmem_max" /etc/sysctl.conf; then
     echo "UDP buffer size settings already configured"
 else
-    # Add UDP buffer size settings to sysctl.conf
     echo "# UDP buffer size settings for improved QUIC performance" >> /etc/sysctl.conf
     echo "net.core.rmem_max=7500000" >> /etc/sysctl.conf
     echo "net.core.wmem_max=7500000" >> /etc/sysctl.conf
-
-    # Apply the settings immediately
     sysctl -p
     echo "UDP buffer sizes configured and applied"
 fi
@@ -112,10 +122,13 @@ fi
 chown -R openfront:openfront /home/openfront
 echo "Set proper ownership for openfront's home directory"
 
-# Set up Traefik reverse proxy
-echo "🔀 Setting up Traefik..."
+# Set up Traefik as an INTERNAL-ONLY reverse proxy, with the Cloudflare Tunnel
+# as the sole public entry point. Neither container publishes a host port —
+# cloudflared reaches Traefik over the shared "web" docker network, and the
+# outside world only ever reaches Cloudflare's edge, never this box directly.
+echo "🔀 Setting up Traefik + Cloudflare Tunnel..."
 
-# Create the shared Docker network used by Traefik and app containers
+# Create the shared Docker network used by Traefik, cloudflared, and app containers
 if docker network ls --format '{{.Name}}' | grep -q '^web$'; then
     echo "Docker network 'web' already exists"
 else
@@ -124,13 +137,7 @@ else
 fi
 
 TRAEFIK_CONFIG_DIR="/home/openfront/traefik"
-TRAEFIK_CERTS_DIR="$TRAEFIK_CONFIG_DIR/certs"
-mkdir -p "$TRAEFIK_CERTS_DIR"
-
-# Write Cloudflare origin certificate and key (passed as env vars)
-echo "$CF_ORIGIN_CERT" > "$TRAEFIK_CERTS_DIR/origin.crt"
-echo "$CF_ORIGIN_KEY" > "$TRAEFIK_CERTS_DIR/origin.key"
-chmod 600 "$TRAEFIK_CERTS_DIR/origin.crt" "$TRAEFIK_CERTS_DIR/origin.key"
+mkdir -p "$TRAEFIK_CONFIG_DIR"
 
 # No [api] block — dashboard is disabled for production.
 # To access it for debugging, SSH tunnel: ssh -L 8080:localhost:8080 user@server
@@ -139,29 +146,15 @@ cat > "$TRAEFIK_CONFIG_DIR/traefik.toml" << 'EOF'
   level = "INFO"
 
 [entryPoints]
-  [entryPoints.websecure]
-    address = ":443"
+  [entryPoints.web]
+    address = ":80"
 
 [providers]
   [providers.docker]
     endpoint = "unix:///var/run/docker.sock"
-    exposedByDefault = false   # Only route containers with traefik.enable=true
+    exposedByDefault = false # Only route containers with traefik.enable=true
     network = "web"
     watch = true
-  [providers.file]
-    filename = "/etc/traefik/tls.toml"
-    watch = true
-EOF
-
-# Static TLS configuration referencing the Cloudflare origin cert
-cat > "$TRAEFIK_CONFIG_DIR/tls.toml" << 'EOF'
-[[tls.certificates]]
-  certFile = "/certs/origin.crt"
-  keyFile  = "/certs/origin.key"
-
-[tls.options]
-  [tls.options.default]
-    minVersion = "VersionTLS12"
 EOF
 
 cat > "$TRAEFIK_CONFIG_DIR/compose.yaml" << 'EOF'
@@ -175,37 +168,44 @@ services:
     image: traefik:v3.6
     container_name: traefik
     restart: unless-stopped
-    ports:
-      - "443:443"
+    # No "ports:" — only reachable from other containers on the "web"
+    # network (cloudflared included). Nothing is exposed to the host's
+    # public interface.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /home/openfront/traefik/traefik.toml:/etc/traefik/traefik.toml:ro
-      - /home/openfront/traefik/tls.toml:/etc/traefik/tls.toml:ro
-      - /home/openfront/traefik/certs:/certs:ro
+    networks:
+      - web
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
     networks:
       - web
 EOF
 
-# Give openfront ownership of config files but keep certs owned by root.
-# Traefik runs as root inside its container so it can read them, but the
-# openfront app user cannot access the TLS private key.
+# Give openfront ownership of the whole config dir — nothing here is a secret
+# the app user shouldn't see (the tunnel token lives in .env.setup, not in
+# these files).
 chown -R openfront:openfront "$TRAEFIK_CONFIG_DIR"
-chown root:root "$TRAEFIK_CERTS_DIR" "$TRAEFIK_CERTS_DIR/origin.crt" "$TRAEFIK_CERTS_DIR/origin.key"
 
 docker compose -f "$TRAEFIK_CONFIG_DIR/compose.yaml" pull
 docker compose -f "$TRAEFIK_CONFIG_DIR/compose.yaml" up -d
 
-if docker ps | grep -q traefik; then
-    echo "✅ Traefik started successfully!"
+if docker ps | grep -q traefik && docker ps | grep -q cloudflared; then
+    echo "✅ Traefik and cloudflared started successfully!"
 else
-    echo "❌ Failed to start Traefik. Check logs with: docker logs traefik"
+    echo "❌ Failed to start Traefik or cloudflared. Check logs with: docker logs traefik / docker logs cloudflared"
     exit 1
 fi
 
 # Create directory for OpenTelemetry configuration
 echo "📊 Setting up Node Exporter and OpenTelemetry Collector..."
 OTEL_CONFIG_DIR="/home/openfront/otel"
-
 if [ ! -d "$OTEL_CONFIG_DIR" ]; then
     mkdir -p "$OTEL_CONFIG_DIR"
     echo "Created OpenTelemetry configuration directory"
@@ -220,7 +220,7 @@ receivers:
         - job_name: 'node'
           scrape_interval: 10s
           static_configs:
-            - targets: ['localhost:9100']  # Node Exporter endpoint
+            - targets: ['localhost:9100'] # Node Exporter endpoint
           relabel_configs:
             - source_labels: [__address__]
               regex: '.*'
@@ -239,7 +239,7 @@ exporters:
     headers:
       Authorization: "Basic ${OTEL_AUTH_HEADER}"
     tls:
-      insecure: true  # Set to false in production with proper certs
+      insecure: true # Set to false in production with proper certs
 
 service:
   pipelines:
@@ -270,11 +270,6 @@ docker run -d \
 echo "🚀 Starting OpenTelemetry Collector..."
 docker pull otel/opentelemetry-collector-contrib:latest
 docker rm -f otel-collector 2> /dev/null || true
-# Run OpenTelemetry Collector with appropriate permissions
-echo "🚀 Starting OpenTelemetry Collector..."
-docker pull otel/opentelemetry-collector-contrib:latest
-docker rm -f otel-collector 2> /dev/null || true
-
 docker run -d \
     --name=otel-collector \
     --restart=unless-stopped \
@@ -295,12 +290,15 @@ echo "====================================================="
 echo "🎉 SETUP COMPLETE!"
 echo "====================================================="
 echo "The openfront user has been set up and has Docker permissions."
-echo "UDP buffer sizes have been configured for optimal QUIC/WebSocket performance."
-echo "Traefik reverse proxy is running (HTTP :80, HTTPS :443 with Cloudflare origin cert)."
+echo "UDP buffer sizes have been configured for optimal QUIC performance."
+echo "Traefik is running as an internal-only reverse proxy — no public ports open."
+echo "cloudflared is tunneling to Cloudflare's edge. Set the tunnel's Public"
+echo "Hostname (Zero Trust dashboard) to point at: http://traefik:80"
 echo "Node Exporter is collecting system metrics."
 echo "OpenTelemetry Collector is forwarding metrics to your endpoint."
 echo ""
 echo "📝 Configuration:"
-echo "   - Config Directory: $OTEL_CONFIG_DIR"
-echo "   - OpenTelemetry Endpoint: $OTEL_EXPORTER_OTLP_ENDPOINT"
+echo "  - Traefik config:  $TRAEFIK_CONFIG_DIR"
+echo "  - OTel config dir: $OTEL_CONFIG_DIR"
+echo "  - OTel endpoint:   $OTEL_EXPORTER_OTLP_ENDPOINT"
 echo "====================================================="
